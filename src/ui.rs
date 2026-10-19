@@ -2,6 +2,7 @@
 
 use crate::{
     app::{App, Confirm, Edit, Pane, Popup, PromptKind, ReqTab, RespTab, TableCur},
+    config::Action,
     model::{AuthKind, KV, METHODS},
     vim::{Mode, Syntax, Vim},
 };
@@ -13,9 +14,29 @@ use ratatui::{
     widgets::{Block, BorderType, Clear, List, ListItem, Paragraph},
     Frame,
 };
+use std::cell::Cell;
 
-const ACCENT: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
+
+thread_local! {
+    /// The theme color, set from the current mode at the start of every frame.
+    static ACCENT: Cell<Color> = const { Cell::new(Color::Cyan) };
+}
+
+fn accent() -> Color {
+    ACCENT.get()
+}
+
+/// The status-line label and theme color for the current input mode.
+fn mode_theme(app: &App) -> (&'static str, Color) {
+    match app.edit.map(|e| app.vim(e).mode) {
+        None => ("NAV", Color::Cyan),
+        Some(Mode::Insert) => ("INSERT", Color::Yellow),
+        Some(Mode::Visual) => ("VISUAL", Color::Magenta),
+        Some(Mode::VisualLine) => ("V-LINE", Color::Magenta),
+        Some(_) => ("NORMAL", Color::Green),
+    }
+}
 
 type Cursor = Option<(u16, u16)>;
 
@@ -39,6 +60,7 @@ fn method_color(method: &str) -> Color {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    ACCENT.set(mode_theme(app).1);
     let [main, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
     let mut cursor = None;
     if app.zoom {
@@ -59,6 +81,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let c = draw_response(f, app, resp);
         cursor = a.or(b).or(c);
     }
+    if let Some((x, y)) = cursor {
+        draw_completion(f, app, main, x, y);
+    }
     let status_cursor = draw_status(f, app, status);
     let popup_cursor = draw_popup(f, app, main);
     if let Some((x, y)) = status_cursor.or(popup_cursor).or(cursor) {
@@ -69,9 +94,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 /// A bordered pane with its hotkey number and title in the top border.
 fn pane<'a>(n: u8, focused: bool, title: Vec<Span<'a>>) -> Block<'a> {
     let (border, key) = if focused {
-        (Style::new().fg(ACCENT), Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
+        (Style::new().fg(accent()), Style::new().fg(Color::Black).bg(accent()).add_modifier(Modifier::BOLD))
     } else {
-        (dim(), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+        (dim(), Style::new().fg(accent()).add_modifier(Modifier::BOLD))
     };
     let mut spans = vec![Span::styled(format!(" {n} "), key), Span::raw(" ")];
     spans.extend(title);
@@ -88,7 +113,7 @@ fn tabs<'a>(names: Vec<String>, sel: usize, focused: bool) -> Vec<Span<'a>> {
         let style = if i != sel {
             dim()
         } else if focused {
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            Style::new().fg(accent()).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else {
             Style::new().fg(Color::White).add_modifier(Modifier::BOLD)
         };
@@ -276,7 +301,8 @@ fn draw_table(
             ("[ ]", dim().add_modifier(Modifier::CROSSED_OUT), dim().add_modifier(Modifier::CROSSED_OUT))
         };
         buf.set_string(area.x, y, check, if kv.enabled { Style::new().fg(Color::Green) } else { dim() });
-        for (col, x, w, text, style) in [(0, key_x, key_w, &kv.key, key_style), (1, val_x, val_w, &kv.value, val_style)] {
+        for (col, x, w, text, style) in [(0, key_x, key_w, &kv.key, key_style), (1, val_x, val_w, &kv.value, val_style)]
+        {
             let rect = Rect::new(x, y, w, 1);
             let selected = i == cur.row && col == cur.col;
             if selected && editing {
@@ -371,6 +397,7 @@ fn draw_response(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
                     Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" {} ms  {} ", r.elapsed.as_millis(), human_size(r.size)), dim()),
+                Span::styled(if r.truncated { "(truncated) " } else { "" }, Style::new().fg(Color::Yellow)),
             ]);
             block = block.title(info.right_aligned());
         }
@@ -389,12 +416,17 @@ fn draw_response(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
     if let Some(elapsed) = app.sending() {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = FRAMES[(elapsed.as_millis() / 80) as usize % FRAMES.len()];
-        let text = format!("{frame} Sending… {:.1}s   (Ctrl-c to cancel)", elapsed.as_secs_f32());
+        let cancel = match app.keys.label(Action::Cancel) {
+            k if k.is_empty() => String::new(),
+            k => format!("   ({k} to cancel)"),
+        };
+        let text = format!("{frame} Sending… {:.1}s{cancel}", elapsed.as_secs_f32());
         buf.set_stringn(inner.x + 1, inner.y, text, inner.width as usize - 1, Style::new().fg(Color::Yellow));
         return None;
     }
     if app.response.is_none() {
-        buf.set_stringn(inner.x + 1, inner.y, "No response yet — press s to send", inner.width as usize - 1, dim());
+        let text = format!("No response yet — press {} to send", app.keys.label(Action::Send));
+        buf.set_stringn(inner.x + 1, inner.y, text, inner.width as usize - 1, dim());
         return None;
     }
     let editing = app.edit == Some(Edit::Response);
@@ -404,35 +436,142 @@ fn draw_response(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
     }
 }
 
-fn hints(app: &App) -> &'static str {
+/// Join `(keys, description)` hints, leaving out actions that have no key.
+fn join_hints(parts: &[(String, &str)]) -> String {
+    parts.iter().filter(|(k, _)| !k.is_empty()).map(|(k, d)| format!("{k} {d}")).collect::<Vec<_>>().join("  ")
+}
+
+fn hints(app: &App) -> String {
+    let k = |a| app.keys.label(a);
+    let fixed = |s: &str| s.to_string();
+    if app.completion.is_some() {
+        return "Tab/^n next  S-Tab/^p prev  ⏎ insert variable  (keep typing to filter)".into();
+    }
+    let send = k(Action::Send);
     if let Some(e) = app.edit {
         let single = matches!(e, Edit::Url | Edit::Cell | Edit::Prompt);
-        return match (app.vim(e).mode, single, e) {
-            (Mode::Insert, true, Edit::Cell) => "Esc normal  ⏎ accept  Tab next cell",
-            (Mode::Insert, true, Edit::Url) => "Esc normal  ⏎ send",
-            (Mode::Insert, true, _) => "Esc normal  ⏎ accept",
-            (Mode::Insert, false, _) => "Esc normal  ^s send",
-            (Mode::Search, ..) => "⏎ search  Esc cancel",
-            (Mode::Visual | Mode::VisualLine, ..) => "y yank  d delete  c change  Esc cancel",
-            (_, _, Edit::Response) => "Esc back  v visual  y yank  / search  n/N next/prev",
-            (_, _, Edit::Prompt) => "Esc cancel  ⏎ accept  i insert",
-            (_, _, Edit::Env) => "Esc save+close  i insert  o new line  dd delete line  u undo  ^s send",
-            _ => "Esc back  i insert  v visual  u undo  / search  ^s send",
+        let parts = match (app.vim(e).mode, single, e) {
+            (Mode::Insert, true, Edit::Cell) => {
+                vec![(fixed("Esc"), "normal"), (fixed("⏎"), "accept"), (fixed("Tab"), "next cell")]
+            }
+            (Mode::Insert, true, Edit::Url) => vec![(fixed("Esc"), "normal"), (fixed("⏎"), "accept"), (send, "send")],
+            (Mode::Insert, true, _) => vec![(fixed("Esc"), "normal"), (fixed("⏎"), "accept")],
+            (Mode::Insert, false, _) => vec![(fixed("Esc"), "normal"), (send, "send")],
+            (Mode::Search, ..) => vec![(fixed("⏎"), "search"), (fixed("Esc"), "cancel")],
+            (Mode::Visual | Mode::VisualLine, ..) => {
+                vec![(fixed("y"), "yank"), (fixed("d"), "delete"), (fixed("c"), "change"), (fixed("Esc"), "cancel")]
+            }
+            (_, _, Edit::Response) => vec![
+                (fixed("Esc"), "back"),
+                (fixed("v"), "visual"),
+                (fixed("y"), "yank"),
+                (fixed("/"), "search"),
+                (fixed("n/N"), "next/prev"),
+            ],
+            (_, _, Edit::Prompt) => vec![(fixed("Esc"), "cancel"), (fixed("⏎"), "accept"), (fixed("i"), "insert")],
+            (_, _, Edit::Env) => vec![
+                (fixed("Esc"), "save+close"),
+                (fixed("i"), "insert"),
+                (fixed("o"), "new line"),
+                (fixed("dd"), "delete line"),
+                (fixed("u"), "undo"),
+                (send, "send"),
+            ],
+            _ => vec![
+                (fixed("Esc"), "back"),
+                (fixed("i"), "insert"),
+                (fixed("v"), "visual"),
+                (fixed("u"), "undo"),
+                (fixed("/"), "search"),
+                (send, "send"),
+            ],
         };
+        return join_hints(&parts);
     }
-    match (app.focus, app.req_tab) {
-        (Pane::Collection, _) => "j/k move  l open  ⏎ open+focus  a new  A folder  r rename  d delete  ? help",
-        (Pane::Url, _) => "i edit  c change  ⏎ send  m method  :w save  ? help",
-        (Pane::Request, ReqTab::Params | ReqTab::Headers) => {
-            "hjkl move  i edit  o add  d delete  ␣ toggle  [ ] tabs  s send  ? help"
+    let tabs = || {
+        let (prev, next) = (k(Action::PrevTab), k(Action::NextTab));
+        if prev.is_empty() && next.is_empty() {
+            String::new()
+        } else {
+            format!("{prev} {next}")
         }
-        (Pane::Request, ReqTab::Body) => "⏎ edit  i insert  j/k scroll  [ ] tabs  s send  ? help",
-        (Pane::Request, ReqTab::Auth) => "j/k move  h/l type  i edit  [ ] tabs  s send  ? help",
-        (Pane::Response, _) => "j/k scroll  ⏎ cursor  v select  / search  y copy all  [ ] tabs  ? help",
+    };
+    let help = (k(Action::Help), "help");
+    let parts = match (app.focus, app.req_tab) {
+        (Pane::Collection, _) => vec![
+            (fixed("j/k"), "move"),
+            (fixed("l/⏎"), "open"),
+            (k(Action::NewRequest), "new"),
+            (k(Action::NewFolder), "folder"),
+            (k(Action::Rename), "rename"),
+            (k(Action::Delete), "delete"),
+            help,
+        ],
+        (Pane::Url, _) => vec![
+            (fixed("i"), "edit"),
+            (fixed("c"), "change"),
+            (send, "send"),
+            (k(Action::Method), "method"),
+            (fixed(":w"), "save"),
+            help,
+        ],
+        (Pane::Request, ReqTab::Params | ReqTab::Headers) => vec![
+            (fixed("hjkl"), "move"),
+            (fixed("i"), "edit"),
+            (k(Action::AddRow), "add"),
+            (k(Action::DeleteRow), "delete"),
+            (k(Action::ToggleRow), "toggle"),
+            (tabs(), "tabs"),
+            (send, "send"),
+            help,
+        ],
+        (Pane::Request, ReqTab::Body) => vec![
+            (fixed("⏎"), "edit"),
+            (fixed("i"), "insert"),
+            (fixed("j/k"), "scroll"),
+            (tabs(), "tabs"),
+            (send, "send"),
+            help,
+        ],
+        (Pane::Request, ReqTab::Auth) => vec![
+            (fixed("j/k"), "move"),
+            (fixed("h/l"), "type"),
+            (fixed("i"), "edit"),
+            (tabs(), "tabs"),
+            (send, "send"),
+            help,
+        ],
+        (Pane::Response, _) => vec![
+            (fixed("j/k"), "scroll"),
+            (fixed("⏎"), "cursor"),
+            (fixed("v"), "select"),
+            (fixed("/"), "search"),
+            (k(Action::CopyResponse), "copy all"),
+            (tabs(), "tabs"),
+            help,
+        ],
+    };
+    join_hints(&parts)
+}
+
+/// The pane keys, `1-4` with the defaults.
+fn fixed_panes(app: &App) -> String {
+    let keys: Vec<String> = [Action::FocusCollection, Action::FocusUrl, Action::FocusRequest, Action::FocusResponse]
+        .into_iter()
+        .map(|a| app.keys.label(a))
+        .collect();
+    if keys == ["1", "2", "3", "4"] {
+        "1-4".into()
+    } else {
+        keys.join(" ")
     }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) -> Cursor {
+    // On a one-row terminal the status line falls outside the buffer.
+    if area.height == 0 || area.bottom() > f.area().bottom() {
+        return None;
+    }
     let buf = f.buffer_mut();
     if let Some(cmd) = &app.cmdline {
         let text = format!(":{cmd}");
@@ -447,13 +586,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) -> Cursor {
         let x = area.x + (text.chars().count() as u16).min(area.width.saturating_sub(1));
         return Some((x, area.y));
     }
-    let (label, color) = match vim.map(|v| v.mode) {
-        None => ("NAV", Color::Blue),
-        Some(Mode::Insert) => ("INSERT", Color::Yellow),
-        Some(Mode::Visual) => ("VISUAL", Color::Magenta),
-        Some(Mode::VisualLine) => ("V-LINE", Color::Magenta),
-        Some(_) => ("NORMAL", Color::Green),
-    };
+    let (label, color) = mode_theme(app);
     let chip = format!(" {label} ");
     let chip_style = Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD);
     buf.set_stringn(area.x, area.y, &chip, area.width as usize, chip_style);
@@ -467,7 +600,14 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) -> Cursor {
             Span::styled(format!(" {}  {}:{}/{} ", v.pending(), p.y + 1, p.x + 1, v.line_count()), dim())
         }
         (None, Some(v)) => Span::styled(format!(" {} ", v.pending()), dim()),
-        (None, None) => Span::styled(" 1-4 panes  E env  : cmd ", dim()),
+        (None, None) => {
+            let parts = [
+                (fixed_panes(app), "panes"),
+                (app.keys.label(Action::Env), "env"),
+                (app.keys.label(Action::Command), "cmd"),
+            ];
+            Span::styled(format!(" {} ", join_hints(&parts)), dim())
+        }
     };
     let right_w = right.content.chars().count() as u16;
     let hint_w = area.right().saturating_sub(x).saturating_sub(right_w);
@@ -476,6 +616,39 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) -> Cursor {
         buf.set_span(area.right() - right_w, area.y, &right, right_w);
     }
     None
+}
+
+/// The `@` variable completion list, just below (or above) the cursor.
+fn draw_completion(f: &mut Frame, app: &App, area: Rect, x: u16, y: u16) {
+    let Some((names, sel)) = &app.completion else {
+        return;
+    };
+    let shown = names.len().min(8);
+    // Fit the longest name plus a space each side and the borders, up to a cap.
+    let longest = names.iter().map(|n| n.chars().count()).max().unwrap_or(0) as u16;
+    let w = (longest + 4).clamp(9, 60).min(area.width);
+    let h = shown as u16 + 2;
+    let below = y + 1 + h <= area.bottom();
+    let top = if below { y + 1 } else { y.saturating_sub(h).max(area.y) };
+    let left = x.min(area.right().saturating_sub(w));
+    let rect = Rect::new(left, top, w, h.min(area.height));
+    let skip = (sel + 1).saturating_sub(shown);
+    let lines: Vec<Line> = names
+        .iter()
+        .enumerate()
+        .skip(skip)
+        .take(shown)
+        .map(|(i, n)| {
+            let line = Line::raw(format!(" {n:<width$} ", width = w.saturating_sub(4) as usize));
+            if i == *sel {
+                line.style(Style::new().fg(Color::Black).bg(accent()))
+            } else {
+                line
+            }
+        })
+        .collect();
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(popup_block("env")), rect);
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -487,7 +660,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 fn popup_block<'a>(title: &'a str) -> Block<'a> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(Style::new().fg(ACCENT))
+        .border_style(Style::new().fg(accent()))
         .title(Line::styled(format!(" {title} "), bold()))
 }
 
@@ -508,7 +681,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
     match &app.popup {
         None => None,
         Some(Popup::Help { scroll }) => {
-            let lines = help_lines();
+            let lines = help_lines(app);
             let rect = centered(area, 72, lines.len() as u16 + 2);
             let max = (lines.len() as u16 + 2).saturating_sub(rect.height);
             let block = popup_block("Help").title_bottom(Line::styled(" j/k scroll · any other key closes ", dim()));
@@ -523,7 +696,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
                 .enumerate()
                 .map(|(i, (name, key))| {
                     let line = Line::from(vec![
-                        Span::styled(format!(" {key} "), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" {key} "), Style::new().fg(accent()).add_modifier(Modifier::BOLD)),
                         Span::styled(format!(" {name:<8}"), Style::new().fg(method_color(name))),
                     ]);
                     if i == *sel {
@@ -538,7 +711,7 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
             None
         }
         Some(Popup::Confirm { msg, action }) => {
-            let key = |k: &'static str| Span::styled(k, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD));
+            let key = |k: &'static str| Span::styled(k, Style::new().fg(accent()).add_modifier(Modifier::BOLD));
             let mut opts = vec![key(" y"), Span::raw(" yes   "), key("n"), Span::raw(" no")];
             if !matches!(action, Confirm::Delete(_)) {
                 opts.extend([Span::raw("   "), key("s"), Span::raw(" save first")]);
@@ -567,62 +740,80 @@ fn draw_popup(f: &mut Frame, app: &mut App, area: Rect) -> Cursor {
     }
 }
 
-fn help_lines() -> Vec<Line<'static>> {
-    const HELP: &[(&str, &str)] = &[
-        ("Everywhere", ""),
-        ("1 2 3 4", "jump to pane (number shown in each border)"),
-        ("Tab / S-Tab", "next / previous pane"),
-        ("Ctrl-h/j/k/l", "move to the pane in that direction"),
-        ("[ ]  or  H L", "previous / next tab"),
-        ("s  or  Ctrl-s", "send request (Ctrl-s works while editing too)"),
-        ("m", "choose HTTP method (then g p u a d h o)"),
-        ("z", "zoom the focused pane"),
-        ("E  or  :env", "edit the collection's .env variables (Esc saves)"),
-        (":w  :w name", "save / save as"),
-        (":new  :q  :wq  :q!", "new request / quit"),
-        ("Ctrl-c", "cancel a running request"),
-        ("q", "quit"),
-        ("", ""),
-        ("Collection", ""),
-        ("j k g G", "move"),
-        ("l / Enter", "open request (Enter also jumps to the URL) / toggle folder"),
-        ("h", "collapse folder / go to parent"),
-        ("a  A", "new request / new folder"),
-        ("r  d  R", "rename or move / delete / reload from disk"),
-        ("(name prompts)", "path from the root; Ctrl-u clears the folder prefix"),
-        ("", ""),
-        ("Params, Headers, Auth", ""),
-        ("h j k l", "move between cells"),
-        ("i / Enter", "edit cell      c  replace cell"),
-        ("o  O", "add row below / above"),
-        ("d", "delete row     Space  enable / disable row"),
-        ("Tab / S-Tab", "while editing: next / previous cell"),
-        ("", ""),
-        ("Body and Response", ""),
-        ("j k g G ^d ^u", "scroll"),
-        ("Enter", "enter the editor in normal mode (i a o… also work)"),
-        ("=", "body: pretty-print the JSON (normal mode)"),
-        ("y", "response: copy everything to the clipboard"),
-        ("", ""),
-        ("Vim editing (URL, cells, body, response)", ""),
-        ("Esc", "insert → normal → back to pane navigation"),
-        ("h j k l w b e 0 ^ $", "motions, with counts; also gg G f t F T ; % { }"),
-        ("i a I A o O", "insert"),
-        ("d c y + motion", "operators; dd cc yy D C x s r ~ J p P"),
-        ("iw aw i\" a\" i( a{ …", "text objects"),
-        ("v  V", "visual / visual line"),
-        ("u  Ctrl-r", "undo / redo"),
-        ("/  n  N", "search"),
-        ("", ""),
-        ("Variables", ""),
-        ("{{name}}", "replaced from the collection's .env file or the environment"),
+fn help_lines(app: &App) -> Vec<Line<'static>> {
+    let k = |a| app.keys.label(a);
+    let both = |a, b| format!("{}  {}", k(a), k(b));
+    let help: Vec<(String, &str)> = vec![
+        ("Everywhere".into(), ""),
+        (
+            [Action::FocusCollection, Action::FocusUrl, Action::FocusRequest, Action::FocusResponse].map(k).join(" "),
+            "jump to pane (number shown in each border)",
+        ),
+        (both(Action::NextPane, Action::PrevPane), "next / previous pane"),
+        (
+            [Action::PaneLeft, Action::PaneDown, Action::PaneUp, Action::PaneRight].map(k).join(" "),
+            "move to the pane left / below / above / right",
+        ),
+        (both(Action::PrevTab, Action::NextTab), "previous / next tab of the focused pane (3 or 4)"),
+        (k(Action::Send), "send request (ctrl/alt keys also work while editing)"),
+        (k(Action::Method), "choose HTTP method (then g p u a d h o)"),
+        (k(Action::Zoom), "zoom the focused pane"),
+        (format!("{}  or  :env", k(Action::Env)), "edit the collection's .env variables (Esc saves)"),
+        (":w  :w name".into(), "save / save as"),
+        (":new  :q  :wq  :q!".into(), "new request / quit"),
+        (":w! name".into(), "save as, overwriting an existing request"),
+        (k(Action::Cancel), "cancel a running request"),
+        (k(Action::Quit), "quit"),
+        (k(Action::Help), "this help"),
+        (String::new(), ""),
+        ("Collection".into(), ""),
+        ("j k g G".into(), "move"),
+        ("l / Enter".into(), "open request / toggle folder (focus stays here)"),
+        ("h".into(), "collapse folder / go to parent"),
+        (both(Action::NewRequest, Action::NewFolder), "new request / new folder"),
+        (
+            [Action::Rename, Action::Delete, Action::Reload].map(k).join("  "),
+            "rename or move / delete / reload from disk",
+        ),
+        ("(name prompts)".into(), "path from the root; Ctrl-u clears the folder prefix"),
+        (String::new(), ""),
+        ("Params, Headers, Auth".into(), ""),
+        ("h j k l".into(), "move between cells"),
+        ("i / Enter".into(), "edit cell      c  replace cell"),
+        (both(Action::AddRow, Action::AddRowAbove), "add row below / above"),
+        (k(Action::DeleteRow), "delete row"),
+        (k(Action::ToggleRow), "enable / disable row"),
+        ("Tab / S-Tab".into(), "while editing: next / previous cell"),
+        (String::new(), ""),
+        ("Body and Response".into(), ""),
+        ("j k g G ^d ^u".into(), "scroll"),
+        ("Enter".into(), "enter the editor in normal mode (i a o… also work)"),
+        ("=".into(), "body: pretty-print the JSON (normal mode)"),
+        (k(Action::CopyResponse), "response: copy everything to the clipboard"),
+        (String::new(), ""),
+        ("Vim editing (URL, cells, body, response)".into(), ""),
+        ("Esc".into(), "insert → normal → back to pane navigation"),
+        ("h j k l w b e 0 ^ $".into(), "motions, with counts; also gg G f t F T ; % { }"),
+        ("i a I A o O".into(), "insert"),
+        ("d c y + motion".into(), "operators; dd cc yy D C x s r ~ J p P"),
+        ("iw aw i\" a\" i( a{ …".into(), "text objects"),
+        ("v  V".into(), "visual / visual line"),
+        ("u  Ctrl-r".into(), "undo / redo"),
+        ("/  n  N".into(), "search"),
+        (String::new(), ""),
+        ("Variables".into(), ""),
+        ("{{name}}".into(), "replaced from the collection's .env file or the environment"),
+        ("@name".into(), "while typing: pick a .env variable (Tab/^n ^p, Enter inserts {{name}})"),
+        (String::new(), ""),
+        ("Keys".into(), ""),
+        ("config.toml".into(), "rebind the keys above: lazypost --print-config"),
     ];
-    HELP.iter()
+    help.into_iter()
         .map(|(keys, desc)| {
             if desc.is_empty() {
-                Line::styled(format!(" {keys}"), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD))
+                Line::styled(format!(" {keys}"), Style::new().fg(accent()).add_modifier(Modifier::BOLD))
             } else {
-                Line::from(vec![Span::styled(format!("   {keys:<22}"), bold()), Span::raw(*desc)])
+                Line::from(vec![Span::styled(format!("   {:<22}", keys.trim()), bold()), Span::raw(desc)])
             }
         })
         .collect()

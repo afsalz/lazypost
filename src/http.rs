@@ -3,7 +3,7 @@
 use crate::model::{substitute, AuthKind, Request};
 use base64::Engine;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Read,
     time::{Duration, Instant},
 };
@@ -18,6 +18,8 @@ pub struct Response {
     pub json: bool,
     pub elapsed: Duration,
     pub size: usize,
+    /// The body was longer than `MAX_BODY` and was cut off.
+    pub truncated: bool,
 }
 
 pub fn send(req: &Request, vars: &HashMap<String, String>) -> Result<Response, String> {
@@ -37,8 +39,14 @@ pub fn send(req: &Request, vars: &HashMap<String, String>) -> Result<Response, S
     }
     let mut has_content_type = false;
     for h in req.headers.iter().filter(|h| h.enabled && !h.key.is_empty()) {
-        has_content_type |= h.key.eq_ignore_ascii_case("content-type");
-        r = r.set(sub(&h.key).trim(), sub(&h.value).trim());
+        let key = sub(&h.key);
+        let key = key.trim();
+        // The Auth tab wins over an Authorization header row; ureq would send both.
+        if req.auth.kind != AuthKind::None && key.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        has_content_type |= key.eq_ignore_ascii_case("content-type");
+        r = r.set(key, sub(&h.value).trim());
     }
     match req.auth.kind {
         AuthKind::None => {}
@@ -66,25 +74,29 @@ pub fn send(req: &Request, vars: &HashMap<String, String>) -> Result<Response, S
     };
     let status = resp.status();
     let status_text = resp.status_text().to_string();
-    let mut names = resp.headers_names();
-    names.dedup();
+    let mut seen = HashSet::new();
     let mut headers = Vec::new();
-    for name in names {
+    for name in resp.headers_names() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
         for v in resp.all(&name) {
             headers.push((name.clone(), v.to_string()));
         }
     }
     let mut bytes = Vec::new();
-    resp.into_reader().take(MAX_BODY).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    resp.into_reader().take(MAX_BODY + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    let truncated = bytes.len() as u64 > MAX_BODY;
+    bytes.truncate(MAX_BODY as usize);
     let elapsed = start.elapsed();
     let size = bytes.len();
     let mut body = String::from_utf8_lossy(&bytes).into_owned();
     let mut json = false;
-    if matches!(body.trim_start().chars().next(), Some('{') | Some('[')) {
+    if !truncated && matches!(body.trim_start().chars().next(), Some('{') | Some('[')) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             body = serde_json::to_string_pretty(&v).unwrap_or(body);
             json = true;
         }
     }
-    Ok(Response { status, status_text, headers, body, json, elapsed, size })
+    Ok(Response { status, status_text, headers, body, json, elapsed, size, truncated })
 }

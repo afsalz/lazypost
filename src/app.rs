@@ -4,6 +4,7 @@
 //! editor, then pane navigation. `Esc` always moves one layer up.
 
 use crate::{
+    config::{Action, Keymap},
     http::{self, Response},
     model::{self, Auth, AuthKind, Node, Request, KV, METHODS},
     vim::{self, Outcome, Syntax, Vim},
@@ -89,8 +90,38 @@ pub struct TableCur {
     pub top: usize,
 }
 
+/// Keys handled in pane navigation, before the focused pane sees them.
+const NAV_ACTIONS: &[Action] = &[
+    Action::Send,
+    Action::Cancel,
+    Action::Quit,
+    Action::Help,
+    Action::Command,
+    Action::Method,
+    Action::Env,
+    Action::Zoom,
+    Action::NextPane,
+    Action::PrevPane,
+    Action::PaneLeft,
+    Action::PaneRight,
+    Action::PaneUp,
+    Action::PaneDown,
+    Action::FocusCollection,
+    Action::FocusUrl,
+    Action::FocusRequest,
+    Action::FocusResponse,
+    Action::NextTab,
+    Action::PrevTab,
+];
+
+const COLLECTION_ACTIONS: &[Action] =
+    &[Action::NewRequest, Action::NewFolder, Action::Rename, Action::Delete, Action::Reload];
+
+const TABLE_ACTIONS: &[Action] = &[Action::AddRow, Action::AddRowAbove, Action::DeleteRow, Action::ToggleRow];
+
 pub struct App {
     pub root: PathBuf,
+    pub keys: Keymap,
     pub tree: Vec<Node>,
     pub tree_state: ListState,
     collapsed: HashSet<PathBuf>,
@@ -123,17 +154,20 @@ pub struct App {
     pending: Option<(Receiver<Result<Response, String>>, Instant)>,
 
     pub popup: Option<Popup>,
+    /// `.env` names matching the `@word` being typed, and the selected one.
+    pub completion: Option<(Vec<String>, usize)>,
     pub cmdline: Option<String>,
     pub message: Option<(String, bool, Instant)>,
     pub quit: bool,
 }
 
 impl App {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(root: PathBuf, keys: Keymap) -> Self {
         let mut body = Vim::new(false);
         body.line_numbers = true;
         let mut app = Self {
             root,
+            keys,
             tree: Vec::new(),
             tree_state: ListState::default(),
             collapsed: HashSet::new(),
@@ -166,6 +200,7 @@ impl App {
             resp_headers: Vim::read_only(),
             pending: None,
             popup: None,
+            completion: None,
             cmdline: None,
             message: None,
             quit: false,
@@ -250,7 +285,7 @@ impl App {
         self.message = Some((msg.into(), false, Instant::now()));
     }
 
-    fn error(&mut self, msg: impl Into<String>) {
+    pub fn error(&mut self, msg: impl Into<String>) {
         self.message = Some((msg.into(), true, Instant::now()));
     }
 
@@ -296,9 +331,15 @@ impl App {
     }
 
     /// Save to the current file, `name` in the target directory, or prompt for a name.
-    fn save(&mut self, name: Option<&str>) -> bool {
+    /// Saving under the name of another existing request needs `force` (`:w!`).
+    fn save(&mut self, name: Option<&str>, force: bool) -> bool {
         let path = if let Some(n) = name.and_then(model::rel_path) {
-            self.root.join(format!("{n}.toml"))
+            let path = self.root.join(format!("{n}.toml"));
+            if !force && path.exists() && self.current.as_ref() != Some(&path) {
+                self.error(format!("{} already exists (:w! {n} to overwrite)", self.rel(&path)));
+                return false;
+            }
+            path
         } else if let Some(p) = self.current.clone() {
             p
         } else {
@@ -359,7 +400,9 @@ impl App {
     }
 
     fn finish_prompt(&mut self, kind: PromptKind, text: &str) {
-        let Some(name) = model::rel_path(text) else { return };
+        let Some(name) = model::rel_path(text) else {
+            return;
+        };
         match kind {
             PromptKind::NewRequest => self.new_request(&name),
             PromptKind::NewFolder => {
@@ -370,7 +413,9 @@ impl App {
                 }
             }
             PromptKind::Rename => {
-                let Some(node) = self.selected_node().cloned() else { return };
+                let Some(node) = self.selected_node().cloned() else {
+                    return;
+                };
                 let file = if node.is_dir { name } else { format!("{name}.toml") };
                 let to = self.root.join(file);
                 if to == node.path {
@@ -397,7 +442,7 @@ impl App {
                 }
             }
             PromptKind::SaveAs => {
-                self.save(Some(&name));
+                self.save(Some(&name), false);
             }
         }
     }
@@ -444,7 +489,12 @@ impl App {
     // ---- environment ---------------------------------------------------
 
     fn open_env(&mut self) {
-        let text = fs::read_to_string(self.root.join(".env")).unwrap_or_default();
+        // Refuse to open an unreadable file: saving the empty buffer would wipe it.
+        let text = match fs::read_to_string(self.root.join(".env")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return self.error(format!("Cannot open .env: {e}")),
+        };
         self.env.set_text(text.strip_suffix('\n').unwrap_or(&text));
         self.edit = Some(Edit::Env);
     }
@@ -533,11 +583,12 @@ impl App {
         } else if let Some(e) = self.edit {
             self.vim_mut(e).paste(text);
         }
+        self.refresh_completion();
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('s') {
+        // Chords like ctrl-s send from anywhere, even while typing.
+        if self.keys.is_chord(Action::Send, &key) {
             return self.send();
         }
         match self.popup.take() {
@@ -549,9 +600,55 @@ impl App {
             self.key_cmdline(key);
         } else if let Some(e) = self.edit {
             self.key_edit(e, key);
+            self.refresh_completion();
         } else {
             self.key_nav(key);
         }
+    }
+
+    /// Recompute the `@` variable completions for the editor being typed in.
+    fn refresh_completion(&mut self) {
+        let prefix = self
+            .edit
+            .filter(|e| matches!(e, Edit::Url | Edit::Cell | Edit::Body))
+            .and_then(|e| self.vim(e).completion_prefix());
+        let Some(prefix) = prefix.map(|p| p.to_lowercase()) else {
+            self.completion = None;
+            return;
+        };
+        let mut names: Vec<String> = model::load_env(&self.root).into_keys().collect();
+        names.retain(|n| n.to_lowercase().contains(&prefix));
+        names.sort_by_key(|n| (!n.to_lowercase().starts_with(&prefix), n.clone()));
+        if names.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let sel = match &self.completion {
+            Some((old, sel)) if *old == names => *sel,
+            _ => 0,
+        };
+        self.completion = Some((names, sel));
+    }
+
+    /// Keys for the completion popup; returns false if the key is for the editor.
+    fn key_completion(&mut self, e: Edit, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some((names, sel)) = self.completion.as_mut() else {
+            return false;
+        };
+        let n = names.len();
+        match key.code {
+            KeyCode::Tab | KeyCode::Down => *sel = (*sel + 1) % n,
+            KeyCode::Char('n') if ctrl => *sel = (*sel + 1) % n,
+            KeyCode::BackTab | KeyCode::Up => *sel = (*sel + n - 1) % n,
+            KeyCode::Char('p') if ctrl => *sel = (*sel + n - 1) % n,
+            KeyCode::Enter => {
+                let name = names[*sel].clone();
+                self.vim_mut(e).complete(&name);
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn key_popup(&mut self, popup: Popup, key: KeyEvent) {
@@ -586,9 +683,11 @@ impl App {
                 }
             }
             Popup::Confirm { msg, action } => match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.confirmed(action),
+                KeyCode::Char('y') => self.confirmed(action),
+                // Enter also opens requests, so it must not confirm a delete.
+                KeyCode::Enter if !matches!(action, Confirm::Delete(_)) => self.confirmed(action),
                 KeyCode::Char('s') if !matches!(action, Confirm::Delete(_)) => {
-                    if self.save(None) {
+                    if self.save(None, false) {
                         self.confirmed(action);
                     }
                 }
@@ -601,7 +700,9 @@ impl App {
 
     fn key_cmdline(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let Some(cmd) = self.cmdline.as_mut() else { return };
+        let Some(cmd) = self.cmdline.as_mut() else {
+            return;
+        };
         match key.code {
             KeyCode::Esc => self.cmdline = None,
             KeyCode::Char('c') if ctrl => self.cmdline = None,
@@ -629,13 +730,13 @@ impl App {
         let arg = Some(arg.trim()).filter(|a| !a.is_empty());
         match name {
             "" => {}
-            "w" | "write" => {
-                self.save(arg);
+            "w" | "write" | "w!" | "write!" => {
+                self.save(arg, name.ends_with('!'));
             }
             "q" | "quit" => self.try_quit(),
             "q!" | "quit!" => self.quit = true,
-            "wq" | "x" => {
-                if self.save(arg) {
+            "wq" | "x" | "wq!" => {
+                if self.save(arg, name.ends_with('!')) {
                     self.quit = true;
                 }
             }
@@ -668,8 +769,15 @@ impl App {
 
     fn key_edit(&mut self, e: Edit, key: KeyEvent) {
         let vim = self.vim_mut(e);
-        if e == Edit::Body && vim.mode == vim::Mode::Normal && vim.pending().is_empty() && key.code == KeyCode::Char('=') {
+        if e == Edit::Body
+            && vim.mode == vim::Mode::Normal
+            && vim.pending().is_empty()
+            && key.code == KeyCode::Char('=')
+        {
             self.format_body();
+            return;
+        }
+        if self.key_completion(e, key) {
             return;
         }
         let outcome = self.vim_mut(e).handle_key(key);
@@ -688,17 +796,11 @@ impl App {
                     }
                 }
             }
-            (Edit::Url, out) => {
-                self.edit = None;
-                if out == Outcome::Submit {
-                    self.send();
-                }
-            }
             (Edit::Env, _) => {
                 self.save_env();
                 self.edit = None;
             }
-            (Edit::Body | Edit::Response, _) => self.edit = None,
+            (Edit::Url | Edit::Body | Edit::Response, _) => self.edit = None,
         }
     }
 
@@ -722,46 +824,50 @@ impl App {
     }
 
     fn key_nav(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let idx = PANES.iter().position(|p| *p == self.focus).unwrap_or(0);
-        match key.code {
-            KeyCode::Char('h') if ctrl => self.set_focus(Pane::Collection),
-            KeyCode::Char('l') if ctrl => self.set_focus(self.last_right),
-            KeyCode::Char('j') if ctrl => {
+        if key.code == KeyCode::Esc {
+            self.zoom = false;
+            self.message = None;
+            return;
+        }
+        match self.keys.find(&key, NAV_ACTIONS) {
+            Some(Action::PaneLeft) => self.set_focus(Pane::Collection),
+            Some(Action::PaneRight) => self.set_focus(self.last_right),
+            Some(Action::PaneDown) => {
                 if idx > 0 && idx < 3 {
                     self.set_focus(PANES[idx + 1]);
                 }
             }
-            KeyCode::Char('k') if ctrl => {
+            Some(Action::PaneUp) => {
                 if idx > 1 {
                     self.set_focus(PANES[idx - 1]);
                 }
             }
-            KeyCode::Char('c') if ctrl => {
+            Some(Action::Cancel) => {
                 if self.pending.take().is_some() {
                     self.info("Request cancelled");
                 }
             }
-            KeyCode::Char(c @ '1'..='4') => self.set_focus(PANES[c as usize - '1' as usize]),
-            KeyCode::Tab => self.set_focus(PANES[(idx + 1) % 4]),
-            KeyCode::BackTab => self.set_focus(PANES[(idx + 3) % 4]),
-            KeyCode::Char('q') if !ctrl => self.try_quit(),
-            KeyCode::Char('?') => self.popup = Some(Popup::Help { scroll: 0 }),
-            KeyCode::Char(':') => self.cmdline = Some(String::new()),
-            KeyCode::Char('s') => self.send(),
-            KeyCode::Char('m') => {
+            Some(Action::FocusCollection) => self.set_focus(Pane::Collection),
+            Some(Action::FocusUrl) => self.set_focus(Pane::Url),
+            Some(Action::FocusRequest) => self.set_focus(Pane::Request),
+            Some(Action::FocusResponse) => self.set_focus(Pane::Response),
+            Some(Action::NextPane) => self.set_focus(PANES[(idx + 1) % 4]),
+            Some(Action::PrevPane) => self.set_focus(PANES[(idx + 3) % 4]),
+            Some(Action::Send) => self.send(),
+            Some(Action::Quit) => self.try_quit(),
+            Some(Action::Help) => self.popup = Some(Popup::Help { scroll: 0 }),
+            Some(Action::Command) => self.cmdline = Some(String::new()),
+            Some(Action::Method) => {
                 let sel = METHODS.iter().position(|(m, _)| *m == self.method).unwrap_or(0);
                 self.popup = Some(Popup::Method { sel });
             }
-            KeyCode::Char('E') => self.open_env(),
-            KeyCode::Char('z') => self.zoom = !self.zoom,
-            KeyCode::Esc => {
-                self.zoom = false;
-                self.message = None;
-            }
-            KeyCode::Char(']') | KeyCode::Char('L') => self.cycle_tab(1),
-            KeyCode::Char('[') | KeyCode::Char('H') => self.cycle_tab(-1),
-            _ => match self.focus {
+            Some(Action::Env) => self.open_env(),
+            Some(Action::Zoom) => self.zoom = !self.zoom,
+            Some(Action::NextTab) => self.cycle_tab(1),
+            Some(Action::PrevTab) => self.cycle_tab(-1),
+            Some(_) => {}
+            None => match self.focus {
                 Pane::Collection => self.key_collection(key),
                 Pane::Url => self.key_url(key),
                 Pane::Request => match self.req_tab {
@@ -774,13 +880,17 @@ impl App {
         }
     }
 
+    /// Switch tabs of the focused pane; panes without tabs ignore it.
     fn cycle_tab(&mut self, dir: isize) {
-        if self.focus == Pane::Response {
-            self.resp_tab = if self.resp_tab == RespTab::Body { RespTab::Headers } else { RespTab::Body };
-        } else {
-            let i = REQ_TABS.iter().position(|t| *t == self.req_tab).unwrap_or(0) as isize;
-            self.req_tab = REQ_TABS[(i + dir).rem_euclid(4) as usize];
-            self.set_focus(Pane::Request);
+        match self.focus {
+            Pane::Response => {
+                self.resp_tab = if self.resp_tab == RespTab::Body { RespTab::Headers } else { RespTab::Body };
+            }
+            Pane::Request => {
+                let i = REQ_TABS.iter().position(|t| *t == self.req_tab).unwrap_or(0) as isize;
+                self.req_tab = REQ_TABS[(i + dir).rem_euclid(4) as usize];
+            }
+            Pane::Collection | Pane::Url => {}
         }
     }
 
@@ -788,6 +898,29 @@ impl App {
         let n = self.tree.len();
         let sel = self.tree_state.selected().unwrap_or(0);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match self.keys.find(&key, COLLECTION_ACTIONS) {
+            Some(Action::NewRequest) => {
+                if self.guard(Confirm::New) {
+                    self.start_prompt(PromptKind::NewRequest);
+                }
+                return;
+            }
+            Some(Action::NewFolder) => return self.start_prompt(PromptKind::NewFolder),
+            Some(Action::Rename) if n > 0 => return self.start_prompt(PromptKind::Rename),
+            Some(Action::Reload) => return self.rescan(None),
+            Some(Action::Delete) => {
+                if let Some(node) = self.tree.get(sel) {
+                    let what = if node.is_dir { "folder and everything in it" } else { "request" };
+                    self.popup = Some(Popup::Confirm {
+                        msg: format!("Delete {what} \"{}\"?", node.name),
+                        action: Confirm::Delete(node.path.clone()),
+                    });
+                }
+                return;
+            }
+            Some(_) => return,
+            None => {}
+        }
         let mut select = |i: usize| {
             if n > 0 {
                 self.tree_state.select(Some(i.min(n - 1)));
@@ -800,10 +933,11 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => select(sel.saturating_sub(1)),
             KeyCode::Char('g') => select(0),
             KeyCode::Char('G') => select(usize::MAX),
-            KeyCode::Char('l') | KeyCode::Right => self.activate(false),
-            KeyCode::Enter => self.activate(true),
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => self.activate(),
             KeyCode::Char('h') | KeyCode::Left => {
-                let Some(node) = self.tree.get(sel).cloned() else { return };
+                let Some(node) = self.tree.get(sel).cloned() else {
+                    return;
+                };
                 if node.is_dir && node.expanded {
                     self.collapsed.insert(node.path);
                     self.rescan(None);
@@ -811,30 +945,15 @@ impl App {
                     self.tree_state.select(Some(parent));
                 }
             }
-            KeyCode::Char('a') => {
-                if self.guard(Confirm::New) {
-                    self.start_prompt(PromptKind::NewRequest);
-                }
-            }
-            KeyCode::Char('A') => self.start_prompt(PromptKind::NewFolder),
-            KeyCode::Char('r') if n > 0 => self.start_prompt(PromptKind::Rename),
-            KeyCode::Char('R') => self.rescan(None),
-            KeyCode::Char('d') => {
-                if let Some(node) = self.tree.get(sel) {
-                    let what = if node.is_dir { "folder and everything in it" } else { "request" };
-                    self.popup = Some(Popup::Confirm {
-                        msg: format!("Delete {what} \"{}\"?", node.name),
-                        action: Confirm::Delete(node.path.clone()),
-                    });
-                }
-            }
             _ => {}
         }
     }
 
     /// Open the selected request or toggle the selected folder.
-    fn activate(&mut self, jump: bool) {
-        let Some(node) = self.selected_node().cloned() else { return };
+    fn activate(&mut self) {
+        let Some(node) = self.selected_node().cloned() else {
+            return;
+        };
         if node.is_dir {
             if !self.collapsed.remove(&node.path) {
                 self.collapsed.insert(node.path);
@@ -848,14 +967,11 @@ impl App {
             }
             self.load_into(&node.path);
         }
-        if jump {
-            self.set_focus(Pane::Url);
-        }
     }
 
     fn key_url(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Enter => self.send(),
+            KeyCode::Enter | KeyCode::Char('v') | KeyCode::Char('e') => self.edit = Some(Edit::Url),
             KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Char('A') => {
                 self.url.insert_at_end();
                 self.edit = Some(Edit::Url);
@@ -868,7 +984,6 @@ impl App {
                 self.url.change_all();
                 self.edit = Some(Edit::Url);
             }
-            KeyCode::Char('v') | KeyCode::Char('e') => self.edit = Some(Edit::Url),
             _ => {}
         }
     }
@@ -880,20 +995,21 @@ impl App {
         if read_only && self.response.is_none() {
             return;
         }
+        let copy = read_only && self.keys.is(Action::CopyResponse, &key);
         let vim = self.vim_mut(e);
         let half = vim.half_page();
         match key.code {
+            _ if copy => {
+                let text = vim.text();
+                vim::yank(&text, false);
+                self.info("Copied to clipboard");
+            }
             KeyCode::Char('d') if ctrl => vim.scroll(half),
             KeyCode::Char('u') if ctrl => vim.scroll(-half),
             KeyCode::Char('j') | KeyCode::Down => vim.scroll(1),
             KeyCode::Char('k') | KeyCode::Up => vim.scroll(-1),
             KeyCode::Char('g') => vim.goto(false),
             KeyCode::Char('G') => vim.goto(true),
-            KeyCode::Char('y') if read_only => {
-                let text = vim.text();
-                vim::yank(&text, false);
-                self.info("Copied to clipboard");
-            }
             KeyCode::Enter => self.edit = Some(e),
             KeyCode::Char('i') if read_only => self.edit = Some(e),
             KeyCode::Char('v' | 'V' | '/') | KeyCode::Char('i' | 'a' | 'I' | 'A' | 'o' | 'O') => {
@@ -913,39 +1029,45 @@ impl App {
     }
 
     fn key_table(&mut self, key: KeyEvent) {
-        let Some((rows, cur)) = self.table() else { return };
+        let action = self.keys.find(&key, TABLE_ACTIONS);
+        let Some((rows, cur)) = self.table() else {
+            return;
+        };
         let n = rows.len();
         cur.row = cur.row.min(n.saturating_sub(1));
         // Some(clear) => start editing the selected cell afterwards
         let mut edit = None;
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => cur.row = (cur.row + 1).min(n.saturating_sub(1)),
-            KeyCode::Char('k') | KeyCode::Up => cur.row = cur.row.saturating_sub(1),
-            KeyCode::Char('g') => cur.row = 0,
-            KeyCode::Char('G') => cur.row = n.saturating_sub(1),
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('0') => cur.col = 0,
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('$') => cur.col = 1,
-            KeyCode::Char(' ') | KeyCode::Char('x') if n > 0 => rows[cur.row].enabled ^= true,
-            KeyCode::Char('d') if n > 0 => {
+        match action {
+            Some(Action::ToggleRow) if n > 0 => rows[cur.row].enabled ^= true,
+            Some(Action::DeleteRow) if n > 0 => {
                 let kv = rows.remove(cur.row);
                 vim::yank(&format!("{}: {}", kv.key, kv.value), false);
                 cur.row = cur.row.min(rows.len().saturating_sub(1));
             }
-            KeyCode::Char('o') | KeyCode::Char('O') => {
-                let at = if n == 0 || key.code == KeyCode::Char('O') { cur.row } else { cur.row + 1 };
+            Some(a @ (Action::AddRow | Action::AddRowAbove)) => {
+                let at = if n == 0 || a == Action::AddRowAbove { cur.row } else { cur.row + 1 };
                 rows.insert(at, KV::default());
                 *cur = TableCur { row: at, col: 0, top: cur.top };
                 edit = Some(false);
             }
-            KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Enter => {
-                if n == 0 {
-                    rows.push(KV::default());
-                    cur.col = 0;
+            Some(_) => {}
+            None => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => cur.row = (cur.row + 1).min(n.saturating_sub(1)),
+                KeyCode::Char('k') | KeyCode::Up => cur.row = cur.row.saturating_sub(1),
+                KeyCode::Char('g') => cur.row = 0,
+                KeyCode::Char('G') => cur.row = n.saturating_sub(1),
+                KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('0') => cur.col = 0,
+                KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('$') => cur.col = 1,
+                KeyCode::Char('i') | KeyCode::Char('a') | KeyCode::Enter => {
+                    if n == 0 {
+                        rows.push(KV::default());
+                        cur.col = 0;
+                    }
+                    edit = Some(false);
                 }
-                edit = Some(false);
-            }
-            KeyCode::Char('c') if n > 0 => edit = Some(true),
-            _ => {}
+                KeyCode::Char('c') if n > 0 => edit = Some(true),
+                _ => {}
+            },
         }
         if let Some(clear) = edit {
             self.start_cell(clear);
@@ -994,7 +1116,9 @@ impl App {
     }
 
     fn start_cell(&mut self, clear: bool) {
-        let Some(text) = self.cell_text_mut().map(|s| s.clone()) else { return };
+        let Some(text) = self.cell_text_mut().map(|s| s.clone()) else {
+            return;
+        };
         self.cell.set_text(if clear { "" } else { &text });
         self.cell.insert_at_end();
         self.edit = Some(Edit::Cell);
@@ -1028,7 +1152,9 @@ impl App {
             self.auth_row = next;
             return self.start_cell(false);
         }
-        let Some((rows, cur)) = self.table() else { return };
+        let Some((rows, cur)) = self.table() else {
+            return;
+        };
         match (fwd, cur.col) {
             (true, 0) => cur.col = 1,
             (true, _) => {
@@ -1052,5 +1178,49 @@ impl App {
             }
         }
         self.start_cell(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn app(name: &str) -> App {
+        let root = std::env::temp_dir().join(format!("lazypost-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        model::seed(&root);
+        App::new(root, Keymap::default())
+    }
+
+    #[test]
+    fn save_as_does_not_overwrite() {
+        let mut app = app("save");
+        let other = app.root.join("examples/post-json.toml");
+        let before = fs::read_to_string(&other).unwrap();
+        app.url.set_text("http://changed");
+        assert!(!app.save(Some("examples/post-json"), false));
+        assert_eq!(fs::read_to_string(&other).unwrap(), before);
+        assert!(app.save(Some("examples/post-json"), true));
+        assert!(fs::read_to_string(&other).unwrap().contains("http://changed"));
+        let _ = fs::remove_dir_all(&app.root);
+    }
+
+    #[test]
+    fn enter_does_not_confirm_delete() {
+        let mut app = app("delete");
+        app.focus = Pane::Collection;
+        app.tree_state.select(Some(0));
+        let dir = app.tree[0].path.clone();
+        app.on_key(key('d'));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(dir.exists());
+        app.on_key(key('d'));
+        app.on_key(key('y'));
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&app.root);
     }
 }

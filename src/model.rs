@@ -7,15 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const METHODS: [(&str, char); 7] = [
-    ("GET", 'g'),
-    ("POST", 'p'),
-    ("PUT", 'u'),
-    ("PATCH", 'a'),
-    ("DELETE", 'd'),
-    ("HEAD", 'h'),
-    ("OPTIONS", 'o'),
-];
+pub const METHODS: [(&str, char); 7] =
+    [("GET", 'g'), ("POST", 'p'), ("PUT", 'u'), ("PATCH", 'a'), ("DELETE", 'd'), ("HEAD", 'h'), ("OPTIONS", 'o')];
 
 fn yes() -> bool {
     true
@@ -192,7 +185,9 @@ pub fn substitute(s: &str, vars: &HashMap<String, String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find("{{") {
-        let Some(end) = rest[start..].find("}}") else { break };
+        let Some(end) = rest[start..].find("}}") else {
+            break;
+        };
         let name = rest[start + 2..start + end].trim();
         out.push_str(&rest[..start]);
         match vars.get(name).cloned().or_else(|| std::env::var(name).ok()) {
@@ -221,7 +216,10 @@ pub fn seed(root: &Path) {
     };
     let _ = save(&root.join("examples/get.toml"), &get);
     let _ = save(&root.join("examples/post-json.toml"), &post);
-    let _ = fs::write(root.join(".env"), "# Variables usable as {{name}} in URLs, headers, params and bodies\nbase_url=https://httpbin.org\n");
+    let _ = fs::write(
+        root.join(".env"),
+        "# Variables usable as {{name}} in URLs, headers, params and bodies\nbase_url=https://httpbin.org\n",
+    );
 }
 
 #[cfg(test)]

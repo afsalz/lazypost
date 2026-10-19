@@ -259,6 +259,33 @@ impl Vim {
         self.search_input.as_deref()
     }
 
+    /// In insert mode, the word typed after an `@` that starts a word, e.g. `base_u` in `@base_u`.
+    pub fn completion_prefix(&self) -> Option<String> {
+        if self.mode != Mode::Insert {
+            return None;
+        }
+        let line = &self.lines[self.cur.y];
+        let x = self.cur.x.min(line.len());
+        let start = (0..x).rev().find(|&i| class(line[i], false) != 1).map_or(0, |i| i + 1);
+        let at = start.checked_sub(1).filter(|&i| line[i] == '@')?;
+        if at > 0 && class(line[at - 1], false) == 1 {
+            return None;
+        }
+        Some(line[start..x].iter().collect())
+    }
+
+    /// Replace the `@prefix` before the cursor with `{{name}}`.
+    pub fn complete(&mut self, name: &str) {
+        let Some(prefix) = self.completion_prefix() else {
+            return;
+        };
+        let Pos { y, x } = self.cur;
+        let start = x - prefix.chars().count() - 1;
+        let text: Vec<char> = format!("{{{{{name}}}}}").chars().collect();
+        self.cur.x = start + text.len();
+        self.lines[y].splice(start..x, text);
+    }
+
     // ---- entry points used by the app ----------------------------------
 
     pub fn insert_at_end(&mut self) {
@@ -413,8 +440,7 @@ impl Vim {
 
     /// Insert (possibly multi-line) text at `at`, returning the end position.
     fn insert_text(&mut self, at: Pos, text: &str) -> Pos {
-        let parts: Vec<Vec<char>> =
-            text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect();
+        let parts: Vec<Vec<char>> = text.split('\n').map(|l| l.trim_end_matches('\r').chars().collect()).collect();
         let x = at.x.min(self.lines[at.y].len());
         if parts.len() == 1 {
             let n = parts[0].len();
@@ -528,8 +554,7 @@ impl Vim {
         self.snapshot();
         let text = text.repeat(n.max(1));
         if linewise {
-            let new: Vec<Vec<char>> =
-                text.trim_end_matches('\n').split('\n').map(|l| l.chars().collect()).collect();
+            let new: Vec<Vec<char>> = text.trim_end_matches('\n').split('\n').map(|l| l.chars().collect()).collect();
             let at = if after { self.cur.y + 1 } else { self.cur.y };
             self.lines.splice(at..at, new);
             self.cur = Pos { y: at, x: 0 };
@@ -751,8 +776,7 @@ impl Vim {
                 Some((Pos { y, x: s }, Pos { y, x: e }, MKind::Excl))
             }
             '"' | '\'' | '`' => {
-                let qs: Vec<usize> =
-                    (0..len).filter(|&i| line[i] == c && (i == 0 || line[i - 1] != '\\')).collect();
+                let qs: Vec<usize> = (0..len).filter(|&i| line[i] == c && (i == 0 || line[i - 1] != '\\')).collect();
                 let pair = qs.chunks(2).find(|p| p.len() == 2 && p[1] >= self.cur.x)?;
                 let (a, b) = (pair[0], pair[1]);
                 let (s, e) = if inner { (a + 1, b) } else { (a, b + 1) };
@@ -1590,5 +1614,20 @@ mod tests {
         assert_eq!(out, Outcome::Submit);
         assert_eq!(v.mode, Mode::Normal);
         assert_eq!(v.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), Outcome::Exit);
+    }
+
+    #[test]
+    fn env_completion() {
+        let mut v = Vim::new(true);
+        v.set_text("");
+        v.insert_at_end();
+        feed(&mut v, "@base_u");
+        assert_eq!(v.completion_prefix().as_deref(), Some("base_u"));
+        v.complete("base_url");
+        feed(&mut v, "/get");
+        assert_eq!(v.text(), "{{base_url}}/get");
+        assert_eq!(v.completion_prefix(), None);
+        feed(&mut v, " me@ex");
+        assert_eq!(v.completion_prefix(), None);
     }
 }

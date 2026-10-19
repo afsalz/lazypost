@@ -2,7 +2,16 @@
 name = "lazypost"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 description = "A keyboard-first HTTP client for the terminal with vim keybindings"
+license = "MIT"
+authors = ["Afsal"]
+repository = "https://github.com/afsal/lazypost"
+homepage = "https://github.com/afsal/lazypost"
+readme = "README.md"
+keywords = ["http", "tui", "vim", "rest", "client"]
+categories = ["command-line-utilities", "development-tools", "web-programming::http-client"]
+include = ["src/**/*", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "CHANGELOG.md"]
 
 [dependencies]
 ratatui = "0.30"
@@ -17,3 +26,4 @@ unicode-width = "0.2"
 [profile.release]
 lto = true
 strip = true
+codegen-units = 1
