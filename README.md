@@ -9,6 +9,8 @@ A keyboard-first HTTP client for the terminal, in the spirit of
 by the number in their border, every text field is a vim editor, and requests
 are plain `.toml` files you can keep in git.
 
+![lazypost demo: sending requests, @ variable completion, editing headers](assets/demo.gif)
+
 ## Install
 
 **Prebuilt binary** (Linux and macOS, x86_64 and arm64):
@@ -150,7 +152,8 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI runs these on every push and pull request.
+CI runs these on every push and pull request. The README demo is recorded with
+[vhs](https://github.com/charmbracelet/vhs): `vhs assets/demo.tape`.
 
 ### Releasing
 
