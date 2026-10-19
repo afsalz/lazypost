@@ -32,6 +32,7 @@ Press `?` for the full list.
 | `E` or `:env` | edit the collection's `.env` variables in a vim overlay (`Esc` saves and closes) |
 | `:w`, `:w name`, `:new`, `:q`, `:wq`, `:q!` | save, save as, new request, quit |
 | `i` / `Enter` | edit the focused field (insert / normal mode) |
+| `=` (body, normal mode) | pretty-print the body if it is valid JSON |
 | `o` `O` `d` `Space` | tables: add row, delete row, toggle row |
 | `a` `A` `r` `d` | collection: new request, new folder, rename/move, delete |
 
