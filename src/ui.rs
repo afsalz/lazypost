@@ -1,4 +1,4 @@
-//! Rendering. Every pane shows its hotkey number in the border, btop-style.
+//! Rendering. Every pane shows its hotkey number in its border.
 
 use crate::{
     app::{App, Confirm, Edit, Pane, Popup, PromptKind, ReqTab, RespTab, TableCur},

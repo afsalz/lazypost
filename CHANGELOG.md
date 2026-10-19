@@ -10,7 +10,7 @@ All notable changes to this project are documented here. The format follows
 
 First release.
 
-- Four-pane layout (collection, URL, request, response) reached by number, btop-style.
+- Four-pane layout (collection, URL, request, response), each pane reached by its number.
 - Vim editing in every text field, with the UI accent color following the mode.
 - Requests stored as `.toml` files, folders as directories; `{{var}}` substitution from `.env`.
 - `@name` completion of `.env` variables while typing.

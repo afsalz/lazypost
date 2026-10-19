@@ -3,11 +3,9 @@
 [![CI](https://github.com/afsalz/lazypost/actions/workflows/ci.yml/badge.svg)](https://github.com/afsalz/lazypost/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A keyboard-first HTTP client for the terminal, in the spirit of
-[posting](https://github.com/darrenburns/posting), built with Rust and
-[ratatui](https://ratatui.rs). No mouse required: panes are reached btop-style
-by the number in their border, every text field is a vim editor, and requests
-are plain `.toml` files you can keep in git.
+A keyboard-first HTTP client for the terminal. No mouse required: jump to any
+pane by the number in its border, edit every text field like vim, and keep
+requests as plain `.toml` files in git.
 
 ![lazypost demo: sending requests, @ variable completion, editing headers](assets/demo.gif)
 
