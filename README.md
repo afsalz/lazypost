@@ -1,6 +1,6 @@
 # lazypost
 
-[![CI](https://github.com/afsal/lazypost/actions/workflows/ci.yml/badge.svg)](https://github.com/afsal/lazypost/actions/workflows/ci.yml)
+[![CI](https://github.com/afsalz/lazypost/actions/workflows/ci.yml/badge.svg)](https://github.com/afsalz/lazypost/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A keyboard-first HTTP client for the terminal, in the spirit of
@@ -14,25 +14,25 @@ are plain `.toml` files you can keep in git.
 **Prebuilt binary** (Linux and macOS, x86_64 and arm64):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/afsal/lazypost/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/afsalz/lazypost/main/install.sh | sh
 ```
 
 The script downloads the latest release, verifies its SHA-256 checksum and
 installs `lazypost` into `~/.local/bin`. Set `LAZYPOST_VERSION=v0.1.0` to pin a
 version or `LAZYPOST_INSTALL_DIR=/usr/local/bin` to install elsewhere. You can
 also download an archive by hand from the
-[releases page](https://github.com/afsal/lazypost/releases).
+[releases page](https://github.com/afsalz/lazypost/releases).
 
 **With cargo** (Rust 1.88 or newer):
 
 ```sh
-cargo install --locked --git https://github.com/afsal/lazypost
+cargo install --locked --git https://github.com/afsalz/lazypost
 ```
 
 **From source:**
 
 ```sh
-git clone https://github.com/afsal/lazypost && cd lazypost
+git clone https://github.com/afsalz/lazypost && cd lazypost
 cargo install --locked --path .
 ```
 

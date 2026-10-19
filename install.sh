@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install lazypost from the GitHub releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/afsal/lazypost/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/afsalz/lazypost/main/install.sh | sh
 #
 # Environment:
 #   LAZYPOST_VERSION      release to install, e.g. v0.1.0 (default: latest)
@@ -9,7 +9,7 @@
 
 set -eu
 
-REPO="afsal/lazypost"
+REPO="afsalz/lazypost"
 VERSION="${LAZYPOST_VERSION:-latest}"
 INSTALL_DIR="${LAZYPOST_INSTALL_DIR:-$HOME/.local/bin}"
 

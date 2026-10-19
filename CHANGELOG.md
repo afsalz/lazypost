@@ -18,5 +18,5 @@ First release.
 - Configurable keys in `~/.config/lazypost/config.toml` (`--print-config`, `--check-config`).
 - Prebuilt binaries for Linux and macOS and a `curl | sh` installer.
 
-[Unreleased]: https://github.com/afsal/lazypost/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/afsal/lazypost/releases/tag/v0.1.0
+[Unreleased]: https://github.com/afsalz/lazypost/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/afsalz/lazypost/releases/tag/v0.1.0
