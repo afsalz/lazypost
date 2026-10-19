@@ -667,6 +667,11 @@ impl App {
     }
 
     fn key_edit(&mut self, e: Edit, key: KeyEvent) {
+        let vim = self.vim_mut(e);
+        if e == Edit::Body && vim.mode == vim::Mode::Normal && vim.pending().is_empty() && key.code == KeyCode::Char('=') {
+            self.format_body();
+            return;
+        }
         let outcome = self.vim_mut(e).handle_key(key);
         match (e, outcome) {
             (_, Outcome::Consumed) => {}
@@ -694,6 +699,18 @@ impl App {
                 self.edit = None;
             }
             (Edit::Body | Edit::Response, _) => self.edit = None,
+        }
+    }
+
+    /// Pretty-print the request body if it is valid JSON; `=` in the body's normal mode.
+    fn format_body(&mut self) {
+        match serde_json::from_str::<serde_json::Value>(&self.body.text()) {
+            Ok(v) => {
+                let pretty = serde_json::to_string_pretty(&v).unwrap_or_default();
+                self.body.replace_text(&pretty);
+                self.info("Formatted JSON body");
+            }
+            Err(e) => self.error(format!("Body is not valid JSON: {e}")),
         }
     }
 

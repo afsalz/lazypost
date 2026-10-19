@@ -601,6 +601,7 @@ fn help_lines() -> Vec<Line<'static>> {
         ("Body and Response", ""),
         ("j k g G ^d ^u", "scroll"),
         ("Enter", "enter the editor in normal mode (i a o… also work)"),
+        ("=", "body: pretty-print the JSON (normal mode)"),
         ("y", "response: copy everything to the clipboard"),
         ("", ""),
         ("Vim editing (URL, cells, body, response)", ""),

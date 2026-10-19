@@ -205,6 +205,18 @@ impl Vim {
         self.lines.iter().map(|l| l.iter().collect::<String>()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Replace the whole buffer as one undoable change, keeping the cursor on a valid cell.
+    pub fn replace_text(&mut self, text: &str) {
+        if self.read_only || self.text() == text {
+            return;
+        }
+        self.snapshot();
+        self.lines = text.split('\n').map(|l| l.chars().collect()).collect();
+        self.cur.y = self.cur.y.min(self.lines.len() - 1);
+        self.clamp();
+        self.want_x = self.cur.x;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines[0].is_empty()
     }
@@ -1502,6 +1514,15 @@ mod tests {
             };
             v.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
         }
+    }
+
+    #[test]
+    fn replace_text_is_undoable() {
+        let mut v = run("old", "");
+        v.replace_text("new\nlines");
+        assert_eq!(v.text(), "new\nlines");
+        feed(&mut v, "u");
+        assert_eq!(v.text(), "old");
     }
 
     #[test]
